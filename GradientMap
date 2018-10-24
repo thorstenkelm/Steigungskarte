@@ -1,0 +1,419 @@
+##Steigungskarte = group
+##Gelaendemodell = raster
+##Strassen = vector
+##Verkehrsbauwerke = vector
+##Laenge = number 25
+##Steigungen = output vector
+
+terrain <- Gelaendemodell
+roads <- Strassen
+barrier <- Verkehrsbauwerke
+splitLength <- as.numeric(Laenge)
+
+# load and install packages
+if (!require("rgdal")) install.packages("rgdal")
+library(rgdal)
+if (!require("raster")) install.packages("raster")
+library(raster)
+if (!require("rgeos")) install.packages("rgeos")
+library(rgeos)
+if (!require("ff")) install.packages("ff")
+library(ff)
+
+# get raster resolution
+computationLength <- terrain@data@gain
+
+# set parameter
+bufferDistance <- computationLength + 0.01
+corpBuffer <- computationLength * 10
+
+# project data to ETRS
+crs <- terrain@crs
+
+# project vector data
+if (crs@projargs != roads@proj4string@projargs) {
+roads <- spTransform(roads, crs)
+}
+
+if (crs@projargs != barrier@proj4string@projargs) {
+barrier <- spTransform(barrier, crs)
+}
+
+# clip raster to roads extent
+terrainCorp <- crop(terrain, extent(roads) + corpBuffer)
+
+# create temporary terrain file
+ffFile <- tempfile("terrain.ffdata")
+
+# prepare terrain - efficient reading
+terrain.mat <-
+ff(
+vmode = "double",
+dim = c(ncell(terrainCorp), nlayers(terrainCorp)),
+filename = ffFile,
+pattern = "ff"
+)
+
+# convert raster to matrix
+for (i in 1:nlayers(terrainCorp)) {
+terrain.mat[, i] <- terrainCorp[[i]][]
+}
+
+terrain.ff <- raster(terrainCorp[[1]])
+terrain.ff[] <- 1:ncell(terrainCorp[[1]])
+
+# merge roadsegments - remove mid points
+lines <- gLineMerge(roads, byid = TRUE)
+
+# set line id and convert to spatial lines
+lines <- lapply(1:length(lines@lines[[1]]@Lines), function(x) {
+Lines(lines@lines[[1]]@Lines[[x]], ID = x)
+})
+
+# convert Lines to Spatiallines
+lines <- SpatialLines(lines, proj4string = crs)
+
+# Method to split lines
+SegmentSpatialLines <- function(sl, length = 0) {
+# length must be > 0
+stopifnot(length > 0)
+
+# id local variable
+id <- 0
+
+# list to save splitted lines
+newlines <- list()
+
+# get coordinates from given line
+crds <- coordinates(sl@Lines[[1]])
+
+# create segments
+segments <- CreateSegments(coords = crds, length)
+
+# transform segments to lines-list for spatial lines object
+for (segment in segments) {
+newlines <-
+c(newlines, Lines(list(Line(
+unlist(segment)
+)), ID = as.character(id)))
+id <- id + 1
+}
+
+return(newlines)
+}
+
+# Method to create segments
+CreateSegments <- function(coords, length = 0) {
+# length must be > 0
+stopifnot(length > 0)
+
+# calculate total length line
+total_length <- 0
+
+for (i in 1:(nrow(coords) - 1)) {
+d <-
+sqrt((coords[i, 1] - coords[i + 1, 1]) ^ 2 + (coords[i, 2] - coords[i + 1, 2]) ^ 2)
+total_length <- total_length + d
+}
+
+# calculate stationing of segments
+if (length > 0) {
+stationing <-
+c(seq(from = 0, to = total_length, by = length), total_length)
+
+last <- rev(stationing)[1]
+penultimate <- rev(stationing)[2]
+
+# set minimum distance to length / 2
+if ((last-penultimate < (length/2)) & (length(stationing)) > 2) {
+stationing <- stationing[which(stationing!=rev(stationing)[2])]
+}
+
+} else {
+stationing <- c(seq(from = 0, to = total_length),
+total_length)
+}
+
+# calculate segments and store the in list
+newlines <- list()
+
+for (i in 1:(length(stationing) - 1)) {
+# create segment from pos start to end
+newlines[[i]] <-
+CreateSegment(coords, stationing[i], stationing[i + 1])
+}
+
+return(newlines)
+}
+
+# Method to create line segments
+CreateSegment <- function(coords, from, to) {
+# set local variable
+distance <- 0
+coordsOut <- c()
+biggerThanFrom <- F
+
+# create points along line
+for (i in 1:(nrow(coords) - 1)) {
+d <-
+sqrt((coords[i, 1] - coords[i + 1, 1]) ^ 2 + (coords[i, 2] - coords[i + 1, 2]) ^ 2)
+distance <- distance + d
+if (!biggerThanFrom && (distance > from)) {
+w <- 1 - (distance - from) / d
+x <- coords[i, 1] + w * (coords[i + 1, 1] - coords[i, 1])
+y <- coords[i, 2] + w * (coords[i + 1, 2] - coords[i, 2])
+coordsOut <- rbind(coordsOut, c(x, y))
+biggerThanFrom <- T
+}
+if (biggerThanFrom) {
+if (distance > to) {
+w <- 1 - (distance - to) / d
+x <- coords[i, 1] + w * (coords[i + 1, 1] - coords[i, 1])
+y <- coords[i, 2] + w * (coords[i + 1, 2] - coords[i, 2])
+coordsOut <- rbind(coordsOut, c(x, y))
+break
+}
+coordsOut <-
+rbind(coordsOut, c(coords[i + 1, 1], coords[i + 1, 2]))
+}
+}
+
+return(coordsOut)
+
+}
+
+# Method to create points on line
+CreateSegementPnts <- function(line, sdist, LLength) {
+# get number of points
+ns <- round((LLength / sdist), digits = 0)
+
+# get line coordinates
+lineCoord <- coordinates(line)[[1]]
+
+if (LLength > sdist) {
+# create points along line
+pnts <-
+spsample(line,
+n = ns,
+type = "regular",
+offset = c(0, 0))
+
+# get coordinates of points and add last point
+coord <-
+rbind(coordinates(pnts), lineCoord[nrow(lineCoord),])
+resPnts <- SpatialPoints(coord)
+
+# remove penultimate point if distance < 1m and at least two points on line
+distLastPart <- gDistance(resPnts[ns], resPnts[ns + 1])
+if (distLastPart < 1 &&
+length(resPnts) > 2)
+resPnts <- resPnts[-ns]
+
+} else {
+resPnts <- SpatialPoints(lineCoord)
+}
+
+return(pnts = resPnts)
+}
+
+# get roads with barrier - sharing linesegment
+eLines <- gWithin(barrier, lines, byid = TRUE)
+
+# if roads with barrier
+if(any(eLines)) {
+
+posLineBarrier <- apply(eLines, 1, function(x) {
+return(ifelse(any(x), TRUE, FALSE))
+})
+
+# split road data in roads with and without barrier and convert to spatial lines
+linesBarrier <- SpatialLines(lines@lines[posLineBarrier], proj4string = crs)
+linesNoBarrier <- SpatialLines(lines@lines[!posLineBarrier], proj4string = crs)
+
+# get barriers with roads
+barrierLine <- apply(eLines, 2, function(x) {
+return(ifelse(any(x), TRUE, FALSE))
+})
+
+# split barrier data in barrier with roads and convert to spatial lines
+barrierLine <- SpatialLines(barrier@lines[barrierLine], proj4string = crs)
+
+# clean workspace
+rm(barrier)
+
+# get polygon buffer from barrier lines
+barrierBuffer <- gBuffer(barrierLine, width = bufferDistance)
+
+# split roads with buffers
+linesBarrierPart <- gDifference(linesBarrier, barrierBuffer)
+
+# convert multiple Lines to single Lines
+linesBarrierPart.split <- c()
+# Lines
+for(x in 1:length(linesBarrierPart@lines)) {
+# Line
+for(y in 1:length(linesBarrierPart@lines[[x]]@Lines)) {
+# convert Line to Lines and add to list
+linesBarrierPart.split <- c(linesBarrierPart.split, Lines(linesBarrierPart@lines[[x]]@Lines[[y]], ID="1"))
+}
+}
+
+# merge lines withot barrier and line parts withot barrier
+linesNoBarrier <- c(linesNoBarrier@lines, linesBarrierPart.split)
+
+# set line oid
+for (idBarrier in 1:length(linesNoBarrier)) {
+linesNoBarrier[[idBarrier]]@ID <- as.character(idBarrier)
+}
+
+# get roads not to split
+barrierLinesPart <- gIntersection(linesBarrier, barrierBuffer, byid = TRUE)
+
+#lines(SpatialLines(linesBarrier), col="red")
+# merge barriers
+linesBarrier <- c(barrierLinesPart@lines)
+
+# set line oid
+for (idBarrier in 1:length(linesBarrier)) {
+linesBarrier[[idBarrier]]@ID <- as.character(idBarrier)
+}
+
+# create points on roads with barriers
+lineBarrierSegmentsPnts <- lapply(linesBarrier, function(x) {
+SpatialPoints(x@Lines[[1]]@coords)
+})
+
+} else {
+# add all lines
+linesNoBarrier <- lines@lines
+idBarrier <- 0
+}
+
+# Call method to split lines
+lineNoBarrierSegments <- sapply(linesNoBarrier, function(line) {
+SegmentSpatialLines(line, splitLength)
+})
+
+# create line id
+oid <-
+unlist(mapply(x = lineNoBarrierSegments, i = 1:length(lineNoBarrierSegments), SIMPLIFY = TRUE, function(x, i) {
+paste(rep(i + idBarrier, length(x)), seq(1, length(x)), sep = ".")
+}))
+
+# unlist result
+lineNoBarrierSegments <- unlist(lineNoBarrierSegments)
+
+# set line id
+for (i in 1:length(lineNoBarrierSegments)) {
+lineNoBarrierSegments[[i]]@ID <- as.character(oid[i])
+}
+
+# convert Line to SpatialLine and set projection
+lineNoBarrierSegments <- SpatialLines(lineNoBarrierSegments, proj4string = crs)
+
+# get line length
+lineNoBarrierLengths <- SpatialLinesLengths(lineNoBarrierSegments)
+
+# create points on roads without barriers
+lineNoBarrierSegmentsPnts <- lapply(1:length(lineNoBarrierLengths), function(i) {
+line <- lineNoBarrierSegments@lines[[i]]
+len <- lineNoBarrierLengths[i]
+CreateSegementPnts(line, computationLength, len)
+})
+
+if(any(eLines)) {
+
+# merge points
+linePnts <- c(lineBarrierSegmentsPnts, lineNoBarrierSegmentsPnts)
+
+# merge result lines
+roadsSegments <- c(linesBarrier, lineNoBarrierSegments@lines)
+
+} else {
+
+# merge points
+linePnts <- c(lineNoBarrierSegmentsPnts)
+
+# merge result lines
+roadsSegments <- c(lineNoBarrierSegments@lines)
+}
+
+# get slope and sd from splitted roads
+lineSlope <- lapply(linePnts, function(pnts) {
+# get point position
+pos <- extract(terrain.ff, pnts)
+
+# get values
+zVals <- terrain.mat[as.numeric(pos),]
+
+# create distance matrix and extract values
+dst <- pointDistance(pnts, lonlat = FALSE, allpairs = TRUE)[2:length(pnts), 1:(length(pnts) - 1)]
+
+# check dim
+if (is.null(dim(dst))) {
+dx <- dst
+} else {
+dx <- diag(dst)
+}
+
+# get z difference
+dz <- zVals[-1] - head(zVals, -1)
+
+# get slope in percent
+s <- (dz / dx) * 100
+
+return(list(slope=s,dist=dx))
+})
+
+# get statistics
+# standard deviation
+lineSlope.sd <- sapply(lineSlope, function(x) sd(x$slope))
+lineSlope.sd[is.na(lineSlope.sd)] <- 0
+
+# max slope
+lineSlope.max <- sapply(lineSlope, function(x) max(x$slope))
+
+# mean slope
+lineSlope.mean <- sapply(lineSlope, function(x) sum(x$slope * (x$dist / sum(x$dist))))
+
+# get slope direction
+lineSlope.arrow.LtoH <-
+  sapply(lineSlope.mean, function(x) {
+    ifelse(x > 0, return(">"), ifelse(x < 0, return("<"), return("=")))
+  })
+
+# get slope direction
+lineSlope.arrow.HtoL <-
+  sapply(lineSlope.mean, function(x) {
+    ifelse(x > 0, return("<"), ifelse(x < 0, return(">"), return("=")))
+  })
+
+
+# merge ids
+ifelse(idBarrier>0, oidMerge <- c(1:idBarrier, oid), oidMerge <- oid)
+
+# get line id
+lineId <- sapply(strsplit(oidMerge, ".", fixed = TRUE), function(x) x[[1]][1])
+
+
+# convert lines to spatial lines
+SL <- SpatialLines(roadsSegments, proj4string = crs)
+
+# create attribute data
+outData <-
+data.frame(
+row.names = oidMerge,
+LineOID = oidMerge,
+Line = lineId,
+absslope = round(abs(lineSlope.mean),3),
+slope = round((lineSlope.mean),3),
+maxSlope = round(abs(lineSlope.max),3),
+sd =  round(lineSlope.sd),
+sDir_toL = lineSlope.arrow.HtoL,
+sDir_toH = lineSlope.arrow.LtoH
+)
+
+# convert to spatial dataframe
+SLDF <- SpatialLinesDataFrame(SL, outData)
+
+Steigungen = SLDF
